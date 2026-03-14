@@ -106,15 +106,14 @@ class ZeroDPStage3FCLayer(object):
                 the number of elements in each shard **including padding**.
         """
 
-        """TODO: Your code here"""
-
-        # Hint: You need to handle the case when tensor.numel() is not divisible by 
-        # num_shards by padding zeros at the end of the flattened tensor before 
-        # partitioning. The returned shard should INCLUDE the padded elements.
-        # We keep track of the original shard_size (without padding) for
-        # later use in communication.
-
-        return (np.empty(8), 8)
+        flat = tensor.flatten()
+        numel = flat.size
+        shard_size = int(np.ceil(numel / num_shards))
+        padded_size = shard_size * num_shards
+        if padded_size > numel:
+            flat = np.concatenate([flat, np.zeros(padded_size - numel, dtype=flat.dtype)])
+        shard = flat[shard_idx * shard_size : (shard_idx + 1) * shard_size]
+        return shard.copy(), shard_size
 
     def zero_grad(self):
         self.grad_w_shard = np.zeros_like(self.w_shard)
@@ -141,10 +140,16 @@ class ZeroDPStage3FCLayer(object):
         """
         self.x = x
 
-        """TODO: Your code here"""
+        full_w_flat = np.empty(self.w_shard_size * self.dp_size, dtype=self.w_shard.dtype)
+        self.comm.Allgather(self.w_shard, full_w_flat)
+        full_w = full_w_flat[:self.w_numel].reshape(self.in_dim, self.out_dim)
 
+        full_b_flat = np.empty(self.b_shard_size * self.dp_size, dtype=self.b_shard.dtype)
+        self.comm.Allgather(self.b_shard, full_b_flat)
+        full_b = full_b_flat[:self.b_numel].reshape(1, self.out_dim)
 
-        raise NotImplementedError
+        out = x @ full_w + full_b
+        return out
 
     def backward(self, output_grad: np.ndarray) -> List[np.ndarray]:
         """Backward pass under ZeRO-DP Stage 3.
@@ -174,13 +179,38 @@ class ZeroDPStage3FCLayer(object):
             3) Reduce-scatter flattened full gradients into local shards.
             4) Compute and return ``grad_x``.
             Note: Make sure to update `self.grad_w_shard` and `self.grad_b_shard` in-place.
-            The autograder will call this method and expect the gradients to be populated in 
+            The autograder will call this method and expect the gradients to be populated in
             these attributes for the optimizer step.
         """
 
-        """TODO: Your code here"""
+        # 1. Reconstruct full weights
+        full_w_flat = np.empty(self.w_shard_size * self.dp_size, dtype=self.w_shard.dtype)
+        self.comm.Allgather(self.w_shard, full_w_flat)
+        full_w = full_w_flat[:self.w_numel].reshape(self.in_dim, self.out_dim)
 
-        raise NotImplementedError
+        # 2. Compute full gradients
+        grad_w_full = self.x.T @ output_grad
+        grad_b_full = np.sum(output_grad, axis=0, keepdims=True)
+
+        # 3. Reduce-scatter grad_w
+        grad_w_flat = grad_w_full.flatten()
+        padded_w_size = self.w_shard_size * self.dp_size
+        if padded_w_size > grad_w_flat.size:
+            grad_w_flat = np.concatenate([grad_w_flat, np.zeros(padded_w_size - grad_w_flat.size, dtype=grad_w_flat.dtype)])
+        self.grad_w_shard = np.empty(self.w_shard_size, dtype=grad_w_flat.dtype)
+        self.comm.Reduce_scatter(grad_w_flat, self.grad_w_shard)
+
+        # 4. Reduce-scatter grad_b
+        grad_b_flat = grad_b_full.flatten()
+        padded_b_size = self.b_shard_size * self.dp_size
+        if padded_b_size > grad_b_flat.size:
+            grad_b_flat = np.concatenate([grad_b_flat, np.zeros(padded_b_size - grad_b_flat.size, dtype=grad_b_flat.dtype)])
+        self.grad_b_shard = np.empty(self.b_shard_size, dtype=grad_b_flat.dtype)
+        self.comm.Reduce_scatter(grad_b_flat, self.grad_b_shard)
+
+        # 5. Compute grad_x
+        grad_x = output_grad @ full_w.T
+        return [grad_x]
 
 
 class ZeroDPMLPModel(object):
@@ -314,6 +344,9 @@ class ZeroDPAdam(object):
                     "v": np.zeros_like(param),
                 }
 
-            """TODO: Your code here"""
-
-        raise NotImplementedError
+            s = self.state[key]
+            s["m"] = self.beta1 * s["m"] + (1 - self.beta1) * grad
+            s["v"] = self.beta2 * s["v"] + (1 - self.beta2) * (grad * grad)
+            m_hat = s["m"] / (1 - self.beta1 ** self.step_idx)
+            v_hat = s["v"] / (1 - self.beta2 ** self.step_idx)
+            param -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
